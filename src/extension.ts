@@ -23,6 +23,7 @@ interface SentryConfig {
 class SentryErrorProvider {
   private decorationType: vscode.TextEditorDecorationType;
   private errors: Map<string, SentryError[]> = new Map();
+  private statusBarItem: vscode.StatusBarItem;
 
   constructor() {
     this.decorationType = vscode.window.createTextEditorDecorationType({
@@ -32,6 +33,11 @@ class SentryErrorProvider {
       },
       rangeBehavior: vscode.DecorationRangeBehavior.ClosedClosed,
     });
+
+    this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    this.statusBarItem.command = 'sentry-plugin.refreshErrors';
+    this.updateStatusBar('Ready');
+    this.statusBarItem.show();
   }
 
   private getConfiguration(): SentryConfig {
@@ -83,26 +89,88 @@ class SentryErrorProvider {
   private findErrorsInFile(document: vscode.TextDocument, errors: SentryError[]): Array<{error: SentryError, line: number}> {
     const fileMatches: Array<{error: SentryError, line: number}> = [];
     const fileName = document.fileName.split('/').pop() || '';
+    const text = document.getText();
+    const lines = text.split('\n');
     
     errors.forEach(error => {
-      // Simple matching based on filename and function names
+      let matched = false;
+      
+      // 1. Match by filename in metadata
       if (error.metadata?.filename && error.metadata.filename.includes(fileName)) {
-        // For now, just add to the first line if filename matches
-        fileMatches.push({error, line: 0});
-      } else if (error.culprit) {
-        // Try to find function names in the code
-        const text = document.getText();
-        const lines = text.split('\n');
-        
-        lines.forEach((line, index) => {
-          if (error.culprit && line.includes(error.culprit)) {
-            fileMatches.push({error, line: index});
+        // Try to find function name in the file if available
+        if (error.metadata.function) {
+          const functionMatch = this.findFunctionInFile(lines, error.metadata.function);
+          if (functionMatch !== -1) {
+            fileMatches.push({error, line: functionMatch});
+            matched = true;
           }
-        });
+        }
+        
+        if (!matched) {
+          // Add to first line if filename matches but no specific function found
+          fileMatches.push({error, line: 0});
+          matched = true;
+        }
+      }
+      
+      // 2. Match by culprit (function/method name)
+      if (!matched && error.culprit) {
+        const culpritLine = this.findFunctionInFile(lines, error.culprit);
+        if (culpritLine !== -1) {
+          fileMatches.push({error, line: culpritLine});
+          matched = true;
+        }
+      }
+      
+      // 3. Match by error title keywords in code
+      if (!matched && error.title) {
+        const titleKeywords = this.extractKeywords(error.title);
+        for (const keyword of titleKeywords) {
+          const keywordLine = this.findKeywordInFile(lines, keyword);
+          if (keywordLine !== -1) {
+            fileMatches.push({error, line: keywordLine});
+            break;
+          }
+        }
       }
     });
 
     return fileMatches;
+  }
+
+  private findFunctionInFile(lines: string[], functionName: string): number {
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      // Look for function declarations/definitions
+      if (line.includes(`function ${functionName}`) ||
+          line.includes(`${functionName} =`) ||
+          line.includes(`${functionName}(`)) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private findKeywordInFile(lines: string[], keyword: string): number {
+    // Look for keywords in comments or string literals that might indicate error-prone areas
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i].toLowerCase();
+      if (line.includes(keyword.toLowerCase())) {
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  private extractKeywords(title: string): string[] {
+    // Extract meaningful keywords from error titles
+    const commonWords = ['error', 'exception', 'failed', 'cannot', 'undefined', 'null', 'invalid'];
+    const words = title.toLowerCase().split(/\s+/);
+    return words.filter(word => 
+      word.length > 3 && 
+      !commonWords.includes(word) &&
+      /^[a-zA-Z]+$/.test(word)
+    );
   }
 
   private updateDecorations(editor: vscode.TextEditor) {
@@ -146,29 +214,61 @@ class SentryErrorProvider {
   }
 
   async refreshErrors() {
-    const errors = await this.fetchSentryErrors();
+    const config = this.getConfiguration();
     
-    // Group errors by potential file association
-    this.errors.clear();
-    errors.forEach(error => {
-      if (error.metadata?.filename) {
-        const existing = this.errors.get(error.metadata.filename) || [];
-        existing.push(error);
-        this.errors.set(error.metadata.filename, existing);
-      } else {
-        // Add to a general errors list
-        const existing = this.errors.get('general') || [];
-        existing.push(error);
-        this.errors.set('general', existing);
-      }
-    });
+    if (!config.enabled) {
+      // Clear all decorations if disabled
+      vscode.window.visibleTextEditors.forEach(editor => {
+        editor.setDecorations(this.decorationType, []);
+      });
+      this.updateStatusBar('Disabled');
+      return;
+    }
+    
+    if (!config.authToken || !config.organization || !config.project) {
+      this.updateStatusBar('Not configured');
+      vscode.window.showWarningMessage(
+        'Sentry plugin is enabled but not configured. Please set your Sentry credentials in settings.',
+        'Open Settings'
+      ).then(selection => {
+        if (selection === 'Open Settings') {
+          vscode.commands.executeCommand('workbench.action.openSettings', 'sentryPlugin');
+        }
+      });
+      return;
+    }
 
-    // Update decorations for all visible editors
-    vscode.window.visibleTextEditors.forEach(editor => {
-      this.updateDecorations(editor);
-    });
+    try {
+      this.updateStatusBar('Loading...');
+      const errors = await this.fetchSentryErrors();
+      
+      // Group errors by potential file association
+      this.errors.clear();
+      errors.forEach(error => {
+        if (error.metadata?.filename) {
+          const existing = this.errors.get(error.metadata.filename) || [];
+          existing.push(error);
+          this.errors.set(error.metadata.filename, existing);
+        } else {
+          // Add to a general errors list
+          const existing = this.errors.get('general') || [];
+          existing.push(error);
+          this.errors.set('general', existing);
+        }
+      });
 
-    vscode.window.showInformationMessage(`Loaded ${errors.length} Sentry errors`);
+      // Update decorations for all visible editors
+      vscode.window.visibleTextEditors.forEach(editor => {
+        this.updateDecorations(editor);
+      });
+
+      this.updateStatusBar('Ready', errors.length);
+      vscode.window.showInformationMessage(`Loaded ${errors.length} Sentry errors`);
+    } catch (error) {
+      console.error('Error refreshing Sentry data:', error);
+      this.updateStatusBar('Error');
+      vscode.window.showErrorMessage('Failed to refresh Sentry error data. Check your configuration and network connection.');
+    }
   }
 
   onActiveEditorChanged(editor: vscode.TextEditor | undefined) {
@@ -177,8 +277,19 @@ class SentryErrorProvider {
     }
   }
 
+  private updateStatusBar(status: string, errorCount?: number) {
+    if (errorCount !== undefined) {
+      this.statusBarItem.text = `$(bug) Sentry: ${errorCount} errors`;
+      this.statusBarItem.tooltip = `${errorCount} Sentry errors found. Click to refresh.`;
+    } else {
+      this.statusBarItem.text = `$(bug) Sentry: ${status}`;
+      this.statusBarItem.tooltip = `Sentry Plugin: ${status}. Click to refresh.`;
+    }
+  }
+
   dispose() {
     this.decorationType.dispose();
+    this.statusBarItem.dispose();
   }
 }
 
